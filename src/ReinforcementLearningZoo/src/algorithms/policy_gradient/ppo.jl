@@ -73,7 +73,7 @@ end
 By default, `dist` is set to `Categorical`, which means it will only works
 on environments of discrete actions. To work with environments of continuous
 actions `dist` should be set to `Normal` and the `actor` in the `approximator`
-should be a `GaussianNetwork`. Using it with a `GaussianNetwork` supports 
+should be a `GaussianNetwork`. Using it with a `GaussianNetwork` supports
 multi-dimensional action spaces, though it only supports it under the assumption
 that the dimensions are independent since the `GaussianNetwork` outputs a single
 `μ` and `σ` for each dimension which is used to simplify the calculations.
@@ -149,15 +149,15 @@ function RLBase.prob(
     if p.update_step < p.n_random_start
         @error "todo"
     else
-        μ, logσ =
-            p.approximator.actor(send_to_device(device(p.approximator), state)) |>
-            send_to_host
+        μ, logσ = p.approximator.actor(send_to_device(device(p.approximator), state)) |> send_to_host
+        μ, logσ = reshape(μ, (:, size(state)[2])), reshape(logσ, (:, size(state)[2]))
         StructArray{Normal}((μ, exp.(logσ)))
     end
 end
 
 function RLBase.prob(p::PPOPolicy{<:ActorCritic,Categorical}, state::AbstractArray, mask)
     logits = p.approximator.actor(send_to_device(device(p.approximator), state))
+
     if !isnothing(mask)
         logits .+= ifelse.(mask, 0.0f0, typemin(Float32))
     end
@@ -179,7 +179,7 @@ end
 
 function RLBase.prob(p::PPOPolicy, env::AbstractEnv)
     s = state(env)
-    s = Flux.unsqueeze(s, dims=ndims(s) + 1)
+    s = Flux.unsqueeze(s, ndims(s) + 1)
     mask = ActionStyle(env) === FULL_ACTION_SET ? legal_action_space_mask(env) : nothing
     prob(p, s, mask)
 end
@@ -193,11 +193,12 @@ function (agent::Agent{<:PPOPolicy})(env::MultiThreadEnv)
     dist = prob(agent.policy, env)
     action = rand.(agent.policy.rng, dist)
     if ndims(action) == 2
-        action_log_prob = sum(logpdf.(dist, action), dims=1)
+        # action_log_prob = sum(logpdf.(dist, action), dims = 1)
+        action_log_prob = logpdf.(dist, action)
     else
         action_log_prob = logpdf.(dist, action)
     end
-    EnrichedAction(action; action_log_prob=vec(action_log_prob))
+    EnrichedAction(action; action_log_prob=action_log_prob)
 end
 
 function RLBase.update!(
@@ -213,7 +214,7 @@ function RLBase.update!(
     end
 end
 
-function _update!(p::PPOPolicy, t::Any)
+function _update!(p::PPOPolicy, t::AbstractTrajectory)
     rng = p.rng
     AC = p.approximator
     γ = p.γ
@@ -255,7 +256,7 @@ function _update!(p::PPOPolicy, t::Any)
     advantages = to_device(advantages)
 
     actions_flatten = flatten_batch(select_last_dim(t[:action], 1:n))
-    action_log_probs = select_last_dim(to_device(t[:action_log_prob]), 1:n)
+    action_log_probs = flatten_batch(select_last_dim(t[:action_log_prob], 1:n))
 
     # TODO: normalize advantage
     for epoch in 1:n_epochs
@@ -263,7 +264,10 @@ function _update!(p::PPOPolicy, t::Any)
         for i in 1:n_microbatches
             inds = rand_inds[(i-1)*microbatch_size+1:i*microbatch_size]
             if t isa MaskedPPOTrajectory
-                lam = select_last_dim(flatten_batch(select_last_dim(LAM, 2:n+1)), inds)
+                lam = select_last_dim(
+                    flatten_batch(select_last_dim(LAM, 2:n+1)),
+                    inds,
+                )
 
             else
                 lam = nothing
@@ -279,21 +283,23 @@ function _update!(p::PPOPolicy, t::Any)
             end
 
             r = vec(returns)[inds]
-            log_p = vec(action_log_probs)[inds]
+            log_p = to_device(collect(select_last_dim(action_log_probs, inds)))
             adv = vec(advantages)[inds]
+            # need to reshape adv here to be the same size as log_p. There is 1 advantage estimate for each action. We have
+            # 1 mu and variance for each dimension of the action space. So we need to multiple each dimension of a given action
+            # by its respective advantage. To do so, we are going to copy adv to be the same vector repeated, so we can multiply
+            # elementwise. The following first flips adv from being 512x1 to 1x512, then makes it 2x512 so we can do elementwise ops
+            # with log_p, which is 2x512
+            adv = repeat(permutedims(adv), size(log_p)[1], 1)
 
             ps = Flux.params(AC)
             gs = gradient(ps) do
                 v′ = AC.critic(s) |> vec
                 if AC.actor isa GaussianNetwork
                     μ, logσ = AC.actor(s)
-                    if ndims(a) == 2
-                        log_p′ₐ = vec(sum(normlogpdf(μ, exp.(logσ), a), dims=1))
-                    else
-                        log_p′ₐ = normlogpdf(μ, exp.(logσ), a)
-                    end
-                    entropy_loss =
-                        mean(size(logσ, 1) * (log(2.0f0π) + 1) .+ sum(logσ; dims=1)) / 2
+                    μ, logσ = reshape(μ, (size(a)[1], :)), reshape(logσ, (size(a)[1], :))
+                    log_p′ₐ = normlogpdf(μ, exp.(logσ), a)
+                    entropy_loss = mean(size(logσ, 1) * (log(2.0f0π) + 1) .+ sum(logσ; dims=1)) / 2
                 else
                     # actor is assumed to return discrete logits
                     raw_logit′ = AC.actor(s)
@@ -307,6 +313,7 @@ function _update!(p::PPOPolicy, t::Any)
                     log_p′ₐ = log_p′[a]
                     entropy_loss = -sum(p′ .* log_p′) * 1 // size(p′, 2)
                 end
+
                 ratio = exp.(log_p′ₐ .- log_p)
                 surr1 = ratio .* adv
                 surr2 = clamp.(ratio, 1.0f0 - clip_range, 1.0f0 + clip_range) .* adv
@@ -315,7 +322,7 @@ function _update!(p::PPOPolicy, t::Any)
                 critic_loss = mean((r .- v′) .^ 2)
                 loss = w₁ * actor_loss + w₂ * critic_loss - w₃ * entropy_loss
 
-                ignore_derivatives() do
+                ignore() do
                     p.actor_loss[i, epoch] = actor_loss
                     p.critic_loss[i, epoch] = critic_loss
                     p.entropy_loss[i, epoch] = entropy_loss
