@@ -2,7 +2,7 @@
 include("util.jl")
 include("vpg.jl")
 # include("A2C.jl")
-# include("ppo.jl")
+include("ppo.jl")
 # include("A2CGAE.jl")
 # include("MAC.jl")
 # include("ddpg.jl")
